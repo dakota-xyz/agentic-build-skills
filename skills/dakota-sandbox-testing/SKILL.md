@@ -1,26 +1,64 @@
 ---
 name: dakota-sandbox-testing
 description: |
-  All Dakota sandbox simulation paths in one place — inbound deposits,
-  outbound returns, KYB approval, the amount cap, the indexing quirks,
-  and how to actually drive a payout to completed. Use when integration
-  tests stall, when a tx is stuck pending, or when "Provider Error 502"
-  shows up out of nowhere.
+  All Dakota sandbox simulation paths in one place, inbound deposits,
+  outbound returns, KYB approval, the testnet-only and $2 rules, the
+  wallet faucet, and how to actually drive a payout to completed. Use
+  when integration tests stall, when a tx is stuck pending, or when a
+  sandbox call returns 400 for a value that works in production.
 ---
 
-# Dakota — Sandbox testing
+# Dakota: Sandbox testing
 
-The sandbox runs the same production code paths — same orchestration,
-webhooks, event pipeline — but replaces external providers (Lead Bank,
-Privy) with in-process mocks. This skill is the field guide to what
-works, what doesn't, and what the error messages actually mean.
+The sandbox runs **real crypto custody on testnets** and **mocks the
+banking layer**. Wallets sign and broadcast real testnet transactions;
+the policy engine runs unmodified. Fiat rails (ACH, Fedwire) are
+mocked. Webhooks use the same pipeline, envelope and signing as
+production.
 
-Base URL: `https://api.platform.sandbox.dakota.xyz`
+| Flow | What is mocked | What is real |
+|---|---|---|
+| On-ramp | The USD deposit (`simulateInbound`) | The stablecoin transfer to your destination (testnet) |
+| Off-ramp / one-off payout | The USD outbound to the bank | The on-chain deposit you send (testnet) |
+| Swap | Nothing | Fully on-chain on testnets |
+| KYB / KYC | Review (`simulateOnboarding`) |, |
+
+Base URL: `https://api.platform.sandbox.dakota.xyz`. Dashboard:
+`https://platform.sandbox.dakota.xyz`. The simulation endpoints work
+only there; on the production base URL they return 403.
+
+## The two hard rules
+
+### 1. Testnets only
+
+Object-create endpoints (`POST /customers/{id}/recipients`,
+`POST /recipients/{id}/destinations`, `POST /accounts`,
+`POST /transactions`) reject mainnet networks in sandbox and testnets
+in production:
+
+```
+400 network "ethereum-mainnet" is not allowed in sandbox; use a testnet
+```
+
+| Environment | Accepted |
+|---|---|
+| Sandbox | `ethereum-sepolia`, `base-sepolia`, `polygon-amoy`, `arbitrum-sepolia`, `optimism-sepolia`, `solana-devnet`, `evm` |
+| Production | `ethereum-mainnet`, `base-mainnet`, `polygon-mainnet`, `arbitrum-mainnet`, `optimism-mainnet`, `solana-mainnet`, `evm` |
+
+Pick the network from an env var so one code path works in both.
+
+### 2. $2 per request
+
+```
+400 Invalid Request: amount 5000 exceeds sandbox cap of 2; reduce the amount and retry
+```
+
+The cap applies to `POST /transactions`, every `simulateInbound`, and
+the wallet faucet (422 there). USD, USDC and RD count 1:1. USDT is not
+supported in sandbox yet. Use `"1.00"` / `"2.00"` in fixtures. You can
+stack several requests to show higher volume.
 
 ## The simulation endpoints
-
-All sandbox is gated by `IS_SANDBOX=true` on the tenant. Calling these
-against a production key returns 403.
 
 ### Drive KYB to active
 
@@ -28,106 +66,146 @@ against a production key returns 403.
 await dakota.sandbox.simulateOnboarding({
   type: "kyb_approve",
   applicant_id: customer.application_id, // NOT customer.id
-  simulation_id: `sim_kyb_${customer.id}`,
+  simulation_id: `sim_kyb_${customer.id}`, // required
 });
 ```
 
-Types: `kyb_approve | kyb_reject | kyb_info_request | kyc_approve |
-kyc_reject | kyc_info_request | applicant_activate | applicant_suspend`.
+| `type` | Effect |
+|---|---|
+| `kyb_approve` | Fully approves the customer (business or individual). Creates the recipient, fires `customer.kyb_status.created` |
+| `applicant_activate` | Same as `kyb_approve`. Call one, not both |
+| `kyb_reject` / `applicant_suspend` | Application → `declined`. No webhook |
+| `kyb_info_request` | Application → `request_for_information`. No webhook; poll `customers.get` |
+| `kyc_approve` / `kyc_reject` / `kyc_info_request` | Application status only. To approve an individual, use `kyb_approve` |
+| `poa_reject` | Rejects an individual's proof of address |
 
-Most of the time `kyb_approve` alone is enough — `applicant_activate` is
-auto-folded in.
+Only the API client that owns the customer can simulate. Your role
+also needs the sandbox-simulations permission (else 403).
 
-### Receive USD via ACH
+### Receive USD via ACH or wire
 
 ```ts
 await dakota.sandbox.simulateInbound({
   simulation_id: `sim_dep_${Date.now()}`,
-  type: "ach_inbound",
-  account_id: onramp.id,
-  amount: "2.00",     // sandbox cap is $2
+  type: "ach_inbound",       // or "fedwire_inbound", "fednow_inbound", "swift_inbound"
+  account_id: onramp.id,     // the on-ramp account
+  amount: "2.00",            // cap: $2
   currency: "USD",
 });
 ```
 
-`type: "wire_inbound"` does the same for Fedwire.
+`wire_inbound` is a legacy alias. `simulation_id` makes the call
+replay-safe: the same id with the same params returns the first
+response; conflicting params return 409.
 
-### Receive USDC on-chain (`crypto_inbound`)
+### Fund a wallet (faucet)
 
-```ts
-await dakota.sandbox.simulateInbound({
-  simulation_id: `sim_crypto_${Date.now()}`,
-  type: "crypto_inbound",
-  wallet_id: wallet.id,        // or wallet_address
-  amount: "100.00",
-  currency: "USDC",
-});
-```
+`POST /sandbox/wallets/{wallet_id}/faucet` sends testnet **RD** on
+Base Sepolia to an EVM wallet, up to $2 per call. It returns 202 with a
+`simulation_id`. Poll `dakota.sandbox.getSimulation(id)` until
+`state_position` is `completed`. The TS SDK has no method for it yet;
+see the `fetch` sample in
+[`dakota-receive-usdc`](../dakota-receive-usdc/SKILL.md#sandbox-testing).
 
-**Tenant flag required:** `USE_MOCK_PRIVY=true`. Without it, the Provider
-sandbox service rejects with `FailedPrecondition` and the platform
-returns `502 provider sandbox service returned an error`.
+| Limit | Response |
+|---|---|
+| More than $2 in one call | `422 sandbox-amount-cap-exceeded` |
+| Wallet's daily allowance used | `429 sandbox-faucet-wallet-daily-limit` |
+| Your account's daily allowance used | `429 sandbox-faucet-client-daily-limit` |
+| Shared faucet balance low | `429 sandbox-faucet-float-floor` (contact Dakota) |
 
-The error message in `provider@v1.0.84/internal/sandbox/grpc_server.go`
-spells it out:
+For testnet **USDC**, send it from a public faucet (e.g.
+[Circle faucet](https://faucet.circle.com)), or route an on-ramp at the
+wallet and simulate `ach_inbound`.
 
-> *"crypto-rail simulations require USE_MOCK_PRIVY=true; with real Privy,
-> deposits arrive via real on-chain webhooks"*
+The docs say to fund wallets with real testnet transfers, not
+simulated crypto deposits. The API still has `type: "crypto_inbound"`
+(with `wallet_address`, not `wallet_id`), but where the sandbox does not
+support it you get
+`502 provider sandbox service returned an error`. Use real testnet
+funds instead.
 
-If your tenant has it off, three paths:
+### Drive a payout to completed
 
-1. Ask Dakota Support to flip the flag on your sandbox tenant.
-2. Send real Sepolia USDC from a faucet-funded EOA to the wallet's
-   address — Dakota's webhooks watch the testnet just like mainnet.
-3. Route the on-ramp's crypto destination at the wallet's address and
-   use `ach_inbound` simulation instead — works on every tenant.
+The canonical path for a one-off payout:
 
-### Mark an outbound as returned / failed / rejected
+1. `transactions.create` returns `crypto_address` and `send_amount`.
+2. Send exactly `send_amount` of testnet USDC to `crypto_address`, in
+   one transfer (a signed wallet transaction, or any testnet wallet).
+3. Dakota detects the deposit, the mocked ACH fires, and the tx moves
+   to `completed`. Watch `transaction.one_off.updated`.
+
+### Outbound outcomes (returned / failed / rejected / settled)
 
 ```ts
 await dakota.sandbox.simulateInbound({
   simulation_id: `sim_ret_${Date.now()}`,
   type: "ach_outbound_returned",
-  movement_id: tx.id,            // the transaction KSUID
-  amount: "100.00",
+  account_id: offramp.id,          // required for every fiat type
+  one_off_transaction_id: tx.id,   // movement_id is a legacy alias
+  amount: "1.50",                  // cap: $2
   currency: "USD",
 });
 ```
 
-Other outbound types: `ach_outbound_failed`, `ach_outbound_rejected`,
-`ach_outbound_returned`, `ach_reversal`, plus wire equivalents.
+Types: `ach_outbound_settled | _failed | _rejected | _returned`,
+`ach_reversal`, and the same set for `fedwire_*` and `swift_*`
+(`wire_*` are legacy aliases). The spec defines `account_id` as the
+off-ramp account that funded the one-off. The one-off response does
+not return an account id, so for plain one-offs prefer the canonical
+funding path above.
 
-These let you test failure paths without waiting for real ACH returns.
+## Scenarios
 
-### What's NOT in the dashboard menu
+`simulateInbound` takes a `scenario` (default `success_immediate`).
+List them with `dakota.sandbox.listScenarios()`.
 
-`ach_outbound_settled` exists in the API but **isn't exposed in
-Dakota's own simulation UI**. The canonical sandbox completion path for
-a one-off payout is *not* "force settle"; it's:
+| Scenario | What it does | Valid for | Stateful |
+|---|---|---|---|
+| `success_immediate` | Settles instantly | All except `fednow_inbound` | No |
+| `success_delayed` | Settles after `delay_seconds` (1-86400) | Inbound + outbound settled | No |
+| `compliance_hold` | Pauses for compliance review; advance `release` / `reject` | `ach_inbound`, `fedwire_inbound`, `swift_inbound` | Yes |
+| `manual_review` | Pauses for manual review; advance `approve` / `reject` | `ach_inbound`, `fedwire_inbound`, `swift_inbound` | Yes |
+| `unconfirmed` | Crypto deposit seen, not confirmed; advance `confirm` / `expire` | `crypto_inbound` | Yes |
+| `wrong_chain` / `unsupported_token` / `address_mismatch` | Crypto deposit edge cases | `crypto_inbound` | No |
+| `partial_crypto` | Partial fill (requires `partial_amount`) | `crypto_inbound` | No |
 
-1. Create the payout (`transactions.create`) — returns `crypto_address`.
-2. Send USDC from a wallet (yours, real Sepolia, or `sandbox.simulateInbound(crypto_inbound)` to the wallet first) to the
-   `crypto_address`.
-3. The platform detects the USDC arrival → fires ACH out → tx flips to
-   `completed`.
+Advance a stateful simulation:
 
-See [`dakota-receive-usdc`](../dakota-receive-usdc/SKILL.md) for the
-signed-intent wallet transaction shape.
-
-## The hard limits
-
-### $2 amount cap per simulation
-
+```ts
+await dakota.sandbox.advanceSimulation(simId, { action: "release" });
 ```
-400 Invalid Request: amount 5000 exceeds sandbox cap of 2; reduce the amount and retry
+
+## Inspecting simulations
+
+```ts
+const sim = await dakota.sandbox.getSimulation(simulationId);
+// sim.state           , "accepted" | "rejected" (was the request taken)
+// sim.state_position  , progress, e.g. "completed" | "failed"
+// sim.awaiting_advance, true if stateful and paused
+// sim.callbacks[]     , webhook delivery history
 ```
 
-Applies to every `simulateInbound` regardless of type. Workaround: use
-$1.50 / $2.00 for demos.
+Useful when a webhook didn't fire and you want to know why.
 
-This is `enforceSandboxAmountCap` in the platform — it applies before
-any DB lookups. You can stack multiple simulations to fake higher
-volumes ("3 × $2 deposits = $6") but no single sim can exceed the cap.
+## Error-injection headers
+
+Sandbox reads a few request headers (not in the OpenAPI spec) to force
+error branches on any call:
+
+| Header | Effect |
+|---|---|
+| `X-Sandbox-Scenario` | Preset failure, e.g. `insufficient_funds`, `compliance_block`, `invalid_account`, `network_timeout`, `kyb_rejected`, `invalid_swift` (list: `GET /sandbox/scenarios`) |
+| `X-Sandbox-Error-Status` + `-Message` + `-Step` | Inject a custom error at a pipeline step |
+| `X-Sandbox-Instant-Completion: true` | Async flows complete without an advance call |
+| `X-Sandbox-Skip-Auto-Approval: true` | Keep KYB pending |
+
+Address screening is mocked by pattern: an address that contains
+`hack` or `scam`, or starts with `0xBAD0000`, screens high risk;
+`review` or `manual` screens medium. See the testing docs for the full
+table.
+
+## Other things that bite
 
 ### Recipient name uniqueness per customer
 
@@ -135,144 +213,57 @@ volumes ("3 × $2 deposits = $6") but no single sim can exceed the cap.
 409 Recipient Conflict: A recipient with this name already exists
 ```
 
-KYB auto-creates one recipient named after the customer. Don't fight
-it; reuse it for treasury / on-ramp work, and pick distinct names for
-actual payees.
+KYB auto-creates one recipient named after the customer. Names compare
+case-insensitively, trimmed. Reuse it for treasury / on-ramp work, and
+pick distinct names for actual payees.
 
-### Customer / sandbox reset
+### Customer cleanup
 
-**No customer DELETE endpoint exists.** Confirmed empirically and via
-the OpenAPI spec — `/customers/{id}` only exposes GET. There's no
-sandbox-wide reset either. Workarounds:
+`dakota.customers.delete(id)` (`DELETE /customers/{customer_id}`)
+soft-deletes a customer. It returns 409 once the customer has accounts
+or is a sub-client. There is no sandbox-wide reset. Rotate
+`external_id` per test run and filter your UI to customers your app
+created.
 
-- Rotate `external_id` per test run so test customers are
-  distinguishable.
-- Filter your UI to only show customers your app provisioned (use a
-  side-table keyed by Dakota customer id).
-- Ask Dakota Support for a sandbox tenant reset.
+### Listing one-off transactions
 
-## The known quirks
+`dakota.transactions.list({ customer_id })` returns that customer's
+one-offs (SDK 3.x sends `transaction_type=one_off`). With raw HTTP,
+`customer_id` alone selects the auto-account family; add
+`transaction_type=one_off`.
 
-### `transactions.list({customer_id})` is unreliable
+### Webhooks arrive out of order
 
-The customer-id filter on `transactions.list` returns 0 for some valid
-customer ids whose transactions are visible in an unfiltered call:
-
-```ts
-// Returns 0 for some customers, even when txs exist:
-await dakota.transactions.list({ customer_id }).toArray();
-
-// Always works:
-const all = await dakota.transactions.list().toArray();
-const mine = all.filter(t => (t as any).customer_id === customer_id);
-```
-
-Workaround everywhere in your app until Dakota fixes the index. Not a
-production issue — sandbox-only.
-
-### Pending one-off transactions omit `amount`
-
-`response.Amount` is only set when `SendAmount != nil` (post-quote).
-Pending payouts come back without it. **Cache the submitted amount in
-your own DB** at create time. See
-[`dakota-send-payment`](../dakota-send-payment/SKILL.md#the-amount-field-gotcha).
-
-### `ach_outbound_settled` rejects with `fiat_requires_account_id`
-
-The platform handler at `internal/api/server_sandbox.go:184-193` (the
-`AchOutboundSettled` case) extracts `movement_id` from the body but
-never extracts `account_id`. The downstream Provider validator demands
-both. Result: 400 `fiat_requires_account_id` even when you pass
-`account_id` in the body (the platform drops it).
-
-Don't fight this. Use the canonical path (`wallets.createTransaction` →
-`crypto_address`) instead. `ach_outbound_settled` is not on Dakota's
-public dashboard menu either.
-
-### "Upstream authentication error"
-
-```
-502 Provider Error: Upstream authentication error (please wait a few
-minutes, or contact support if urgent)
-```
-
-The Provider sandbox service is down or rotating credentials. Wait
-2-5 minutes and retry. Persistent? File a support ticket — sandbox is
-operationally maintained.
-
-## Scenarios
-
-Every `simulateInbound` accepts a `scenario` parameter (defaults to
-`success_immediate`):
-
-| Scenario | What it does | Valid for | Stateful |
-|---|---|---|---|
-| `success_immediate` | Settles instantly, webhooks fire in seconds | All | No |
-| `success_delayed` | Settles after `delay_seconds` (default 30) | Inbound + outbound settled | No |
-| `compliance_hold` | Pauses for compliance review; advance with `release`/`reject` | ACH/Wire inbound | Yes |
-| `manual_review` | Pauses for manual review; advance with `approve`/`reject` | ACH/Wire inbound | Yes |
-| `wrong_chain` | Crypto deposit on wrong network | `crypto_inbound` | No |
-| `unsupported_token` | Unsupported token | `crypto_inbound` | No |
-| `address_mismatch` | Wallet address mismatch | `crypto_inbound` | No |
-| `partial_crypto` | Partial fill (requires `partial_amount`) | `crypto_inbound` | No |
-
-For stateful scenarios, advance with:
-
-```ts
-// POST /sandbox/simulations/{id}/advance
-await fetch(`${base}/sandbox/simulations/${simId}/advance`, {
-  method: "POST",
-  body: JSON.stringify({ action: "release" }),
-});
-```
-
-## Inspecting simulations
-
-```ts
-// GET /sandbox/simulations/{id}
-const sim = await dakota.sandbox.getSimulation(simulationId);
-// sim.state — accepted | delivered | failed
-// sim.awaiting_advance — true if stateful and paused
-```
-
-Useful when a webhook didn't fire and you want to know why.
+Sandbox transitions are sub-second, so two events for one resource can
+swap. Treat the `status` in each event as the truth. See
+[`dakota-webhooks`](../dakota-webhooks/SKILL.md).
 
 ## End-to-end test checklist
 
-For a clean E2E that proves your integration works:
-
-- [ ] Create customer → KYB active
-- [ ] Provision wallet + on-ramp + off-ramp
-- [ ] `sandbox.simulateInbound(ach_inbound, $2)` — accepts
-- [ ] Create a payout (`transactions.create`, $1.50) — returns pending
-- [ ] List transactions — confirm the payout is visible via unfiltered
-      list + client filter
-- [ ] Verify the amount renders from your cached value, not Dakota's
-      (Dakota omits it on pending)
-
-A reference implementation lives at
-[neobank-nomad/scripts/e2e-neobank-flow.ts](https://github.com/dakota-xyz/neobank-nomad/blob/main/scripts/e2e-neobank-flow.ts)
-that walks the entire chain and prints a results table.
+- [ ] Create customer → `kyb_approve` → `customers.get` shows `active`
+- [ ] Provision wallet (with a policy) + on-ramp on `ethereum-sepolia`
+- [ ] `simulateInbound(ach_inbound, "2.00")` → USDC lands in the wallet
+      (testnet transfer, `transaction.auto.*` + `wallet.deposit` webhooks)
+- [ ] Create a payout (`transactions.create`, `"1.50"`) → `pending`
+- [ ] Sign a wallet send of `send_amount` to `crypto_address` →
+      payout reaches `completed`
+- [ ] `transactions.list({ customer_id })` shows the payout
 
 ## Production parity
 
 | Behavior | Sandbox | Production |
 |---|---|---|
-| Webhook delivery + signing | Identical | Identical |
+| Webhook delivery + signing | Identical (sandbox key) | Identical (production key) |
 | Event emission + state machine | Identical | Identical |
-| External API calls | In-process mocks | Real Lead Bank + Privy |
-| Money movement | Simulated via `simulateInbound` | Real funds |
-| KYB | Instant via `simulateOnboarding` | Real Sumsub / Persona |
-| Compliance checks | Mock risk scoring | Real TRM screening |
-| Float checks | Always sufficient (configurable) | Real treasury balance |
-
-Where sandbox differs operationally from production, the docs label it
-explicitly. The API surface and webhook payload shapes are identical —
-that's the whole point.
+| Crypto custody + policy engine | Real, on testnets | Real, on mainnets |
+| Banking rails | Mocked | Real |
+| KYB | `simulateOnboarding` | Real compliance review |
+| Address screening | Mock risk patterns | Real screening |
+| Amounts | $2 per request | No cap |
 
 ## What next
 
-- Pair every test you write here with one of the build skills —
+- Pair every test you write here with one of the build skills,
   [`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md),
   [`dakota-receive-usdc`](../dakota-receive-usdc/SKILL.md), etc.
 - For policy enforcement testing,
@@ -280,10 +271,11 @@ that's the whole point.
 
 ## Canonical reference
 
-- Testing overview — [docs.dakota.xyz/documentation/testing](https://docs.dakota.xyz/documentation/testing)
-- Webhooks — [docs.dakota.xyz/documentation/webhooks](https://docs.dakota.xyz/documentation/webhooks)
-- State lifecycles — [docs.dakota.xyz/api-reference/state-lifecycles](https://docs.dakota.xyz/api-reference/state-lifecycles)
+- Testing overview: [docs.dakota.xyz/documentation/testing](https://docs.dakota.xyz/documentation/testing)
+- Webhooks: [docs.dakota.xyz/documentation/webhooks](https://docs.dakota.xyz/documentation/webhooks)
+- State lifecycles: [docs.dakota.xyz/api-reference/state-lifecycles](https://docs.dakota.xyz/api-reference/state-lifecycles)
 - Without the SDK: `POST /sandbox/simulate/inbound`,
-  `POST /sandbox/simulate/onboarding`, `GET /sandbox/simulations/{id}`,
-  `POST /sandbox/simulations/{id}/advance` — see
-  [docs.dakota.xyz/api-reference](https://docs.dakota.xyz/api-reference).
+  `POST /sandbox/simulate/onboarding`, `POST /sandbox/wallets/{id}/faucet`,
+  `GET /sandbox/simulations/{id}`, `POST /sandbox/simulations/{id}/advance`,
+  `GET /sandbox/scenarios`: see
+  [docs.dakota.xyz/api-reference/introduction](https://docs.dakota.xyz/api-reference/introduction).

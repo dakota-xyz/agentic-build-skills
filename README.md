@@ -1,16 +1,16 @@
-# Dakota — Agentic Build Skills
+# Dakota: Agentic Build Skills
 
 Optional skills to give your coding agent (Claude Code, Cursor) a
 head start on Dakota concepts where the field names or call order
 are easy to miss.
 
 The Dakota SDKs and the docs already ship their own agent-facing
-material — `CLAUDE.md` and `AGENTS.md` in each SDK repo. This pack is
+material: `AGENTS.md` and `CLAUDE.md` in the TypeScript and Go SDK repos. This pack is
 just extra shortcuts for common build patterns.
 
-These skills are SDK-agnostic — they describe the concepts and call
+These skills are SDK-agnostic. They describe the concepts and call
 order, not the transport. Use them with the official Dakota SDKs
-(TS, Python, Go), raw HTTP, or whatever client you prefer. Same idea
+(TypeScript, Go), raw HTTP, or whatever client you prefer. Same idea
 applies to the framework and auth choices below: swap in whatever
 your stack already uses.
 
@@ -25,29 +25,31 @@ your stack already uses.
 | [`dakota-receive-usdc`](skills/dakota-receive-usdc/SKILL.md) | Provision a wallet to receive stablecoin on-chain |
 | [`dakota-receive-usd`](skills/dakota-receive-usd/SKILL.md) | Provision an ACH on-ramp to receive USD |
 | [`dakota-send-payment`](skills/dakota-send-payment/SKILL.md) | Send a USDC → USD ACH payout |
-| [`dakota-sandbox-testing`](skills/dakota-sandbox-testing/SKILL.md) | Simulation paths, caps, quirks |
-| [`dakota-compliance-policies`](skills/dakota-compliance-policies/SKILL.md) | Amount-threshold rules |
+| [`dakota-international-payout`](skills/dakota-international-payout/SKILL.md) | SWIFT payouts in USD or a foreign currency (FX quotes) |
+| [`dakota-webhooks`](skills/dakota-webhooks/SKILL.md) | Register a webhook target, verify signatures, map events to flows |
+| [`dakota-sandbox-testing`](skills/dakota-sandbox-testing/SKILL.md) | Simulations, testnet-only and $2 rules, faucet |
+| [`dakota-compliance-policies`](skills/dakota-compliance-policies/SKILL.md) | Wallet policies: caps, approvals, address lists |
 
-The first two are framework / auth choices, not Dakota concepts —
+The first two are framework / auth choices, not Dakota concepts,
 swap them if you're using a different stack. Each skill ends with
 links back to the relevant page on
 [docs.dakota.xyz](https://docs.dakota.xyz) where the canonical
 reference lives.
 
-## Before you build — get a Dakota API key
+## Before you build: get a Dakota API key
 
 Every Dakota call (from these skills, the SDKs, or raw HTTP)
 authenticates with an API key. For **The Agentic Build** you want a
-**sandbox** key — that's where the challenge runs and the only place
+**sandbox** key. That's where the challenge runs and the only place
 you can simulate money movement without it being real.
 
 1. Sign up for The Agentic Build at
-   [dakota.xyz/agentic-build](https://dakota.xyz/agentic-build) —
+   [dakota.xyz/agentic-build](https://dakota.xyz/agentic-build):
    this is how you get into the challenge and get access to the
    sandbox dashboard where your key lives.
 2. Once you're in, sign in to the sandbox dashboard and open
    **API Keys** → **Create New API Key**.
-3. Copy the key — it's a 60-character base64 string shown **only once**.
+3. Copy the key. It is a 44-character URL-safe base64 string, shown **only once**.
 4. Put it in your project's `.env.local`:
 
    ```bash
@@ -62,10 +64,10 @@ Full setup instructions (other required headers, idempotency, etc.):
 
 > Production keys live in a separate dashboard at
 > [platform.dakota.xyz](https://platform.dakota.xyz). You don't need
-> one for the challenge — only when you go live.
+> one for the challenge. You need one only when you go live.
 
 Auth between **your end users** and your app (Supabase, Clerk, etc.) is
-**optional and external to Dakota** — see
+**optional and external to Dakota**: see
 [`dakota-auth-bootstrap`](skills/dakota-auth-bootstrap/SKILL.md) only
 if you're building a multi-user app on top.
 
@@ -95,10 +97,12 @@ done
 
 ## Where else to look
 
-- **API and endpoint reference** — [docs.dakota.xyz](https://docs.dakota.xyz)
-- **SDKs** — [docs.dakota.xyz/documentation/sdks](https://docs.dakota.xyz/documentation/sdks). Each SDK repo also ships its own `AGENTS.md` / `CLAUDE.md` with the full method reference.
-- **The challenge** — [dakota.xyz/agentic-build](https://dakota.xyz/agentic-build)
+- **API and endpoint reference**: [docs.dakota.xyz](https://docs.dakota.xyz)
+- **SDKs**: [docs.dakota.xyz/documentation/sdks](https://docs.dakota.xyz/documentation/sdks). Each SDK repo also ships its own `AGENTS.md` / `CLAUDE.md` with the full method reference.
+- **Feeding docs to your agent**: [docs.dakota.xyz/documentation/using-llms](https://docs.dakota.xyz/documentation/using-llms) and [docs.dakota.xyz/llms.txt](https://docs.dakota.xyz/llms.txt)
+- **Agentic payments (beta)**: payment agents, mandates, x402: [docs.dakota.xyz/documentation/agentic-payments](https://docs.dakota.xyz/documentation/agentic-payments)
+- **The challenge**: [dakota.xyz/agentic-build](https://dakota.xyz/agentic-build)
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Fork and modify freely.
+MIT. See [LICENSE](LICENSE). Fork and modify freely.

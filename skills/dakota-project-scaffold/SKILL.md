@@ -1,7 +1,7 @@
 ---
 name: dakota-project-scaffold
 description: |
-  Where Dakota lives in a Next.js App Router project — directory layout,
+  Where Dakota lives in a Next.js App Router project: directory layout,
   the singleton SDK client, route handlers vs server components, env
   files, and how the pieces talk to Supabase auth. Use when standing up
   a new Dakota-on-Next.js project, when an agent is unsure where to put
@@ -9,13 +9,13 @@ description: |
   from client code (which leaks the API key).
 ---
 
-# Dakota — Project scaffold (Next.js App Router)
+# Dakota: Project scaffold (Next.js App Router)
 
 The whole reason this skill exists: **Dakota API calls must run on the
 server.** The API key cannot ship to the browser. Anything that calls
 Dakota goes in a Server Component, a route handler, or a server action.
 
-This skill is the App Router layout that worked for the neobank demo —
+This skill is the App Router layout that worked for the neobank demo:
 the directory structure, where the singleton lives, what goes where.
 
 ## Directory layout
@@ -55,7 +55,7 @@ your-app/
 └── package.json
 ```
 
-Route groups `(auth)` and `(dashboard)` don't affect URLs — they let
+Route groups `(auth)` and `(dashboard)` don't affect URLs. They let
 you split layouts (e.g. dashboard sidebar vs login splash).
 
 ## `lib/dakota.ts` (server-only)
@@ -83,7 +83,7 @@ export function getDakotaClient(): DakotaClient {
 ```
 
 Import this from any `app/api/*/route.ts` or any Server Component
-(default — components without `"use client"`).
+(the default: components without `"use client"`).
 
 ## Route handler pattern
 
@@ -167,7 +167,7 @@ export default async function DashboardPage() {
 }
 ```
 
-Faster than a route handler — the data flows directly into the
+Faster than a route handler: the data flows directly into the
 component, no extra fetch round-trip. Use route handlers when the
 client needs to trigger a mutation.
 
@@ -178,15 +178,15 @@ client needs to trigger a mutation.
 DAKOTA_API_KEY=
 DAKOTA_ENV=sandbox
 
-# Supabase (anon key — safe in NEXT_PUBLIC_*)
+# Supabase (anon key: safe in NEXT_PUBLIC_*)
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
 
-# Optional — wallet treasury
+# Optional: Dakota's webhook public key (Ed25519 hex, per environment)
 DAKOTA_WEBHOOK_PUBLIC_KEY=
 ```
 
-**Never** prefix `DAKOTA_API_KEY` with `NEXT_PUBLIC_` — that ships it
+**Never** prefix `DAKOTA_API_KEY` with `NEXT_PUBLIC_`: that ships it
 to the browser. The Supabase anon key is safe in `NEXT_PUBLIC_*`
 because RLS enforces what it can do.
 
@@ -199,23 +199,23 @@ because RLS enforces what it can do.
 | "Reusable Dakota SDK client" | `lib/dakota.ts` |
 | "Helper to read the current user" | `lib/supabase/server.ts` |
 | "Schema for a new column" | `supabase/migrations/<timestamp>_<name>.sql` |
-| "Dakota webhook receiver" | `app/api/webhooks/dakota/route.ts` |
+| "Dakota webhook receiver" | `app/api/webhooks/dakota/route.ts` (see `dakota-webhooks`) |
 | "Auth-gated UI section" | `app/(dashboard)/.../page.tsx` |
 | "Public UI section" | `app/page.tsx` or `app/(auth)/...` |
 
 ## What next
 
-- [`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md) —
+- [`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md):
   the first Dakota route you'll write.
 - [`dakota-receive-usdc`](../dakota-receive-usdc/SKILL.md) /
-  [`dakota-receive-usd`](../dakota-receive-usd/SKILL.md) — receive
+  [`dakota-receive-usd`](../dakota-receive-usd/SKILL.md), receive
   rails to wire up next.
 
 ## Canonical reference
 
-- Next.js App Router docs — [nextjs.org/docs/app](https://nextjs.org/docs/app)
-- Next.js route handlers — [nextjs.org/docs/app/building-your-application/routing/route-handlers](https://nextjs.org/docs/app/building-your-application/routing/route-handlers)
-- Next.js server components — [nextjs.org/docs/app/building-your-application/rendering/server-components](https://nextjs.org/docs/app/building-your-application/rendering/server-components)
+- Next.js App Router docs: [nextjs.org/docs/app](https://nextjs.org/docs/app)
+- Next.js route handlers: [nextjs.org/docs/app/building-your-application/routing/route-handlers](https://nextjs.org/docs/app/building-your-application/routing/route-handlers)
+- Next.js server components: [nextjs.org/docs/app/building-your-application/rendering/server-components](https://nextjs.org/docs/app/building-your-application/rendering/server-components)
 
-Dakota itself has no opinion on the framework — this skill is the
+Dakota itself has no opinion on the framework. This skill is the
 pattern that worked for the demo, not a Dakota requirement.

@@ -2,15 +2,15 @@
 name: dakota-auth-bootstrap
 description: |
   End-user authentication for an app that uses Dakota. Auth is OPTIONAL
-  and external to Dakota — Dakota doesn't ship one and doesn't care
+  and external to Dakota. Dakota doesn't ship one and doesn't care
   which one you use. All Dakota calls happen server-side with your
   Dakota API key, no matter what auth layer (if any) sits in front.
   Use this skill only if you're building a multi-user app on top of
-  Dakota (e.g. "my customers can log in and onboard themselves") — and
+  Dakota (e.g. "my customers can log in and onboard themselves"), and
   ask the user which provider they want before writing any code.
 ---
 
-# Dakota — Auth bootstrap
+# Dakota: Auth bootstrap
 
 **Auth is external to Dakota and entirely optional.**
 
@@ -19,7 +19,7 @@ with your Dakota **API key** (`x-api-key` header). Dakota knows
 nothing about your end users.
 
 You only need an auth layer if **you're letting your own users log in
-to your app** — e.g. a SaaS where each signed-in user maps to one
+to your app**: e.g. a SaaS where each signed-in user maps to one
 Dakota customer. If you're building anything else, skip this skill:
 
 - A script, cron job, or CLI → no auth.
@@ -30,7 +30,7 @@ Dakota customer. If you're building anything else, skip this skill:
 If you DO need it, what kind of auth and how it stores user state is
 100% your choice. Dakota has no opinion.
 
-## STEP 1 — Ask the user
+## STEP 1: Ask the user
 
 Before writing any auth code, ASK. Don't pick one for them. Surface
 the options and let them decide:
@@ -54,7 +54,7 @@ Wait for the answer.
 | **Lucia** | Lower-level, full control. |
 | **Custom** | You already have an auth system. |
 
-If they pick **none**, stop here — no auth code needed. Your route
+If they pick **none**, stop here. No auth code needed. Your route
 handlers just call Dakota directly with the API key.
 
 If they pick a provider, the pattern below applies (and there's a
@@ -105,7 +105,7 @@ How you populate the row is provider-specific:
 // app/api/some-action/route.ts (Next.js App Router example)
 
 export async function POST(request: Request) {
-  // 1. Auth gate — get the user from whatever provider you're using
+  // 1. Auth gate: get the user from whatever provider you're using
   const user = await getCurrentUser(request); // your auth helper
   if (!user) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -125,10 +125,10 @@ export async function POST(request: Request) {
 ```
 
 Swap `getCurrentUser` and `db.profiles.findOne` for whatever your
-stack actually uses. The five-line shape is the contract — everything
+stack actually uses. The five-line shape is the contract. Everything
 else is the auth provider's API.
 
-## One concrete example — Supabase
+## One concrete example: Supabase
 
 If the user picks Supabase, the helpers below work. If they pick
 something else, adapt the route handler pattern above and skip the
@@ -148,7 +148,7 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=
 server, and middleware):
 
 ```ts
-// lib/supabase/client.ts — browser ("use client") code
+// lib/supabase/client.ts: browser ("use client") code
 import { createBrowserClient } from "@supabase/ssr";
 
 export function createClient() {
@@ -160,7 +160,7 @@ export function createClient() {
 ```
 
 ```ts
-// lib/supabase/server.ts — Server Components + Route Handlers
+// lib/supabase/server.ts: Server Components + Route Handlers
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
@@ -190,7 +190,7 @@ export async function createClient() {
 ```
 
 ```ts
-// lib/supabase/middleware.ts — used from middleware.ts
+// lib/supabase/middleware.ts: used from middleware.ts
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
@@ -242,8 +242,9 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   dakota_customer_id text UNIQUE,
   dakota_application_id text UNIQUE,
   -- kyb_status mirrors Dakota's KybStatus enum: active|pending|partner_review|
-  -- rejected|frozen|auto_declined. Stored as free-form text so future Dakota
-  -- additions don't require a migration here.
+  -- rejected|frozen|auto_declined (auto_declined is never returned; an
+  -- automatic decline reads rejected). Stored as free-form text so future
+  -- Dakota additions don't require a migration here.
   kyb_status text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -272,18 +273,18 @@ CREATE POLICY "Users can update own profile"
 
 ## What next
 
-- [`dakota-project-scaffold`](../dakota-project-scaffold/SKILL.md) —
+- [`dakota-project-scaffold`](../dakota-project-scaffold/SKILL.md):
   where the auth helpers slot into a Next.js App Router project.
-- [`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md) —
+- [`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md):
   what to do after a user signs up: create their Dakota customer and
   drive KYB.
 
 ## Canonical reference
 
-- Supabase Next.js docs — [supabase.com/docs/guides/auth/server-side/nextjs](https://supabase.com/docs/guides/auth/server-side/nextjs)
-- Clerk Next.js docs — [clerk.com/docs/quickstarts/nextjs](https://clerk.com/docs/quickstarts/nextjs)
-- NextAuth / Auth.js — [authjs.dev](https://authjs.dev)
-- Lucia — [lucia-auth.com](https://lucia-auth.com)
+- Supabase Next.js docs: [supabase.com/docs/guides/auth/server-side/nextjs](https://supabase.com/docs/guides/auth/server-side/nextjs)
+- Clerk Next.js docs: [clerk.com/docs/quickstarts/nextjs](https://clerk.com/docs/quickstarts/nextjs)
+- NextAuth / Auth.js: [authjs.dev](https://authjs.dev)
+- Lucia: [lucia-auth.com](https://lucia-auth.com)
 
-Dakota has no opinion on the auth layer — this skill is a pattern, not
+Dakota has no opinion on the auth layer. This skill is a pattern, not
 a Dakota requirement.

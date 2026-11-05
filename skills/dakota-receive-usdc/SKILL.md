@@ -1,90 +1,115 @@
 ---
 name: dakota-receive-usdc
 description: |
-  Provision a Dakota wallet (signer → signer group → wallet) so the
-  customer can receive USDC directly on-chain. Use when building any
-  product where customers, counterparties, or upstream payers send
-  stablecoin to the operator's treasury — global payouts, marketplace
-  payments, AI-native treasury, cross-border invoicing.
+  Provision a Dakota wallet (signer → signer group → policy → wallet) so
+  the customer can receive USDC directly on-chain, and send from it with
+  a signed intent. Use when building any product where customers,
+  counterparties, or upstream payers send stablecoin to the operator's
+  treasury, global payouts, marketplace payments, AI-native treasury,
+  cross-border invoicing.
 ---
 
-# Dakota — Receive USDC (treasury wallet)
+# Dakota: Receive USDC (treasury wallet)
 
 A Dakota wallet is a non-custodial multi-sig that holds stablecoin
-on-chain. The customer gets a real EVM address; anyone in the world can
+on-chain. The customer gets a real address; anyone in the world can
 send USDC to it and balances update on-chain in seconds.
 
 This is the modern receive rail. Pair with
 [`dakota-receive-usd`](../dakota-receive-usd/SKILL.md) when you also need
 ACH inbound from US-based payers.
 
-## The chain (3 calls)
+## The chain (4 calls)
 
 ```ts
-import { generateKeyPairSync } from "crypto";
+import { generateKeyPairSync } from "node:crypto";
+import { P256MandateSigner, type PolicyRuleCreateRequest } from "@dakota-xyz/ts-sdk";
 
-// 1. Mint an ES256 (P-256) signer keypair
-const { publicKey, privateKey } = generateKeyPairSync("ec", {
+type Definition = PolicyRuleCreateRequest["definition"];
+
+// 1. Mint a P-256 signer keypair. KEEP privateKeyDer (PKCS#8 DER) in
+//    KMS / HSM / Vault: you need it to send from the wallet and to
+//    change its policies.
+const { privateKey: privateKeyDer } = generateKeyPairSync("ec", {
   namedCurve: "P-256",
   publicKeyEncoding: { type: "spki", format: "der" },
   privateKeyEncoding: { type: "pkcs8", format: "der" },
 });
-const memberKey = Buffer.from(publicKey).toString("base64");
+const signer = P256MandateSigner.fromPrivateKey(privateKeyDer);
+const publicKey = signer.publicKeyBase64(); // base64 DER SPKI
 
-// 2. Register the signer with Dakota
+// 2. Register the signer, then wrap it in a signer group
+//    (wallets attach to groups, not raw signers)
 await dakota.signers.create({
   name: `${customer.name} Operator Signer`,
-  public_key: memberKey,
-  key_type: "ES256", // ◀── uppercase. "es256" is rejected.
+  public_key: publicKey,
+  key_type: "ES256", // ◀── uppercase. "ES256" or "WEBAUTHN" only.
 });
-
-// 3. Wrap it in a signer group (wallets attach to groups, not raw signers)
 const group = await dakota.signerGroups.create({
   name: `${customer.name} Operator Group`,
-  member_keys: [memberKey],
+  member_keys: [publicKey],
 });
 
-// 4. Provision the wallet
+// 3. A policy, so the wallet can SEND. With no policy, every outbound
+//    send is denied. This rule allows a send with 1 group signature.
+//    See dakota-compliance-policies for caps and allowlists.
+const policy = await dakota.policies.create({
+  name: `${customer.name} default policy`,
+  signer_group_id: group.id,
+  rules: [
+    {
+      rule_type: "approval_threshold",
+      action: "allow",
+      definition: { threshold: 1 } as unknown as Definition,
+    },
+  ],
+});
+
+// 4. Provision the wallet. Policies passed here attach with no endorsement.
 const wallet = await dakota.wallets.create({
   customer_id: customer.id,
-  family: "evm",                // EVM family covers Ethereum + Sepolia
+  family: "evm",            // "evm" or "solana"
   name: `${customer.name} Treasury`,
   signer_groups: [group.id],
-  policies: [],                 // empty for now; see dakota-compliance-policies
+  policies: [policy.id],
 });
-// wallet.id       — the wallet KSUID
-// wallet.address  — the on-chain EVM address. SHARE THIS with payers.
+// wallet.id      , the wallet KSUID
+// wallet.address , the on-chain address. SHARE THIS with payers.
 ```
 
-## What goes wrong if you skip the signer
+## What goes wrong if you skip a step
 
-`wallets.create` requires `signer_groups: string[]` and `policies: string[]`
-— both required, can't be empty for `signer_groups`. Without a
-pre-existing signer in the system, `signerGroups.create` rejects with
-`Signer Not Found`. The order is fixed: signer → group → wallet.
+- **No signer:** `signerGroups.create` rejects with `Signer Not Found`.
+  The order is fixed: signer → group → wallet.
+- **`signer_groups: []`:** rejected. A wallet needs at least one group.
+- **`policies: []`:** accepted, but the wallet can only receive. Every
+  send is denied with `No policies found for wallet`. Adding a policy
+  later needs an endorsement (see
+  [`dakota-compliance-policies`](../dakota-compliance-policies/SKILL.md)),
+  so pass one at create time.
 
 ## What goes wrong if you use the wrong key type
 
-The API accepts two `key_type` values: `ES256` and `WEBAUTHN`. They MUST
-be uppercase. The error message ("not one of the allowed values
-[es256, webauthn]") helpfully lowercases them, which leads agents to send
-lowercase, which gets rejected.
+The only `key_type` values are `ES256` and `WEBAUTHN`, in uppercase.
+Any other value returns 400
+`value is not one of the allowed values ["ES256","WEBAUTHN"]`.
 
-**Ed25519 is not supported.** You'll see `Signer Not Found` because the
-key fingerprint doesn't match anything Dakota recognises.
+**Ed25519 is not supported.** `signers.create` rejects it with 400
+`invalid public_key`. Use a P-256 key (`ES256`, base64 DER SPKI) or a
+passkey (`WEBAUTHN`, a base64 COSE ES256/RS256 key; see
+[WebAuthn signing](https://docs.dakota.xyz/documentation/webauthn-signing)).
 
-## The private key — keep or discard?
+## The private key: keep or discard?
 
 | Context | Keep? | Why |
 |---|---|---|
-| Sandbox / demo flow that only uses **one-off transactions** | Discard ok | One-off transactions don't require wallet signing |
-| Production, or any flow that calls `wallets.createTransaction` | **Keep in HSM/KMS** | You sign transfer intents with this key |
+| The wallet only ever receives | Discard ok | Receiving needs no signature |
+| You send from the wallet, or change its policies | **Keep in HSM/KMS** | Each send and each policy change is signed with this key |
 
-If you're doing the canonical Dakota production flow — wallet sends USDC
-to a one-off transaction's `crypto_address` to settle the off-ramp — you
-need the private key for [`wallets.createTransaction`](#wallet-transactions-production-flow).
-Store it in AWS KMS / GCP Cloud KMS / HashiCorp Vault. Do not commit it,
-do not ship it to the browser.
+One-off payouts (`transactions.create`) need no wallet signature, but
+you fund them by sending USDC from the wallet, and that send is signed.
+Store the key in AWS KMS / GCP Cloud KMS / HashiCorp Vault. Do not
+commit it, do not ship it to the browser.
 
 ## Sharing the address with payers
 
@@ -94,67 +119,73 @@ verbatim, with a QR option:
 ```ts
 const wallet = await dakota.wallets.get(walletId);
 console.log("Share this address:", wallet.address);
-// 0x7089a6f92D4f5f5Fbb1eD96B770C1e43F6a92bFf
+const balances = await dakota.wallets.getBalances(walletId);
 ```
 
-The address is the same across the EVM family (Ethereum mainnet,
-Sepolia testnet, Base, Polygon, etc.) — but pick a single network for
-your product and tell payers which one. The most common production
-choice is **Ethereum mainnet** with **USDC** (Circle's contract).
+An `evm` wallet has one address on every EVM chain Dakota supports
+(Ethereum, Base, Arbitrum, Optimism, Polygon, Avalanche, and their
+testnets). Pick one network for your product and tell payers which
+one. Sandbox runs on **testnets** (e.g. Ethereum Sepolia, Base Sepolia).
 
 ## Sandbox testing
 
-Funding a wallet with simulated USDC requires `USE_MOCK_PRIVY=true` on
-your sandbox tenant, which is **off by default**. With it off,
-`sandbox.simulateInbound({ type: 'crypto_inbound', wallet_id })` returns
-502 from the Provider service.
+Sandbox wallets are real on testnets: deposits are real testnet
+transfers and fire the same `wallet.deposit` webhooks as production.
+Three ways to fund one:
 
-Three paths to fund a sandbox wallet:
+1. **Faucet:** `POST /sandbox/wallets/{wallet_id}/faucet` sends testnet
+   RD on Base Sepolia, up to $2 per call. It returns 202 with a
+   `simulation_id`; poll `dakota.sandbox.getSimulation(id)`. The TS SDK
+   has no faucet method yet, so call it over HTTP:
 
-1. **Ask Dakota Support** to flip `USE_MOCK_PRIVY=true` on your tenant.
-   Then `crypto_inbound` simulations work.
-2. **Send real Sepolia USDC** from a faucet-funded EOA
-   ([Circle faucet](https://faucet.circle.com)) to the wallet address.
-   Dakota's webhooks watch the chain.
-3. **Don't fund the wallet** — wire your on-ramp's `crypto_destination_id`
-   to the wallet address, then `sandbox.simulateInbound({ type: 'ach_inbound' })`
-   on the on-ramp simulates the ACH event (this also won't actually mint
-   USDC into the wallet without Privy mock, but it's the cleanest
-   architecture for the demo).
+   ```ts
+   await fetch(`https://api.platform.sandbox.dakota.xyz/sandbox/wallets/${wallet.id}/faucet`, {
+     method: "POST",
+     headers: {
+       "x-api-key": process.env.DAKOTA_API_KEY!,
+       "x-idempotency-key": crypto.randomUUID(),
+       "content-type": "application/json",
+     },
+     body: JSON.stringify({ asset: "RD", amount: "2.00" }),
+   });
+   ```
 
-See [`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md) for the
-gory details.
+2. **Real testnet USDC** from a public faucet (e.g.
+   [Circle faucet](https://faucet.circle.com)) to `wallet.address`.
+3. **ACH in:** an on-ramp whose crypto destination is this wallet, then
+   `sandbox.simulateInbound({ type: "ach_inbound" })`. The USDC leg is a
+   real testnet transfer. See
+   [`dakota-receive-usd`](../dakota-receive-usd/SKILL.md).
 
-## Wallet transactions (production flow)
+See [`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md).
 
-To **send** from the wallet (e.g. to settle a one-off off-ramp transaction
-in production), you sign a transfer intent and post it to
-`POST /wallets/{id}/transactions`:
+## Wallet transactions (sending)
+
+To **send** from the wallet (e.g. to fund a one-off payout's
+`crypto_address`), sign a transfer intent and post it to
+`POST /wallets/{id}/transactions`. The SDK ships the canonicalizer and
+the signer:
 
 ```ts
-import { canonicalize } from "canonicalize"; // RFC 8785 JCS
-import { createSign, createPrivateKey, randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
+import { P256MandateSigner, canonicalJSON, type SendTransactionIntent } from "@dakota-xyz/ts-sdk";
 
-const intent = {
+const signer = P256MandateSigner.fromPrivateKey(privateKeyDer); // from your KMS
+const intent: SendTransactionIntent = {
   wallet_id: wallet.id,
-  caip2: "eip155:1",            // ethereum-mainnet (use 11155111 for sepolia)
+  caip2: "eip155:11155111",   // Ethereum Sepolia. eip155:1 = Ethereum mainnet
   operation: {
     kind: "transfer",
     from: wallet.address,
     to: targetAddress,
-    amount: "100.00",
+    amount: "100",            // shortest form: "100", not "100.00" (see below)
     asset_id: "USDC",
   },
   idempotency_key: randomUUID(),
 };
 
-// Canonicalize per RFC 8785 → SHA-256 → ECDSA P-256 ASN.1 DER → base64
-const canonical = canonicalize(intent);
-const sigDer = createSign("SHA256").update(canonical).sign({
-  key: createPrivateKey({ key: privateKeyDer, format: "der", type: "pkcs8" }),
-  dsaEncoding: "der",
-});
-const signature = sigDer.toString("base64");
+// RFC 8785 JCS → SHA-256 → ECDSA P-256 (DER) → base64
+const signature = signer.sign(new TextEncoder().encode(canonicalJSON(intent)));
 
 await dakota.wallets.createTransaction(wallet.id, {
   signatures: [signature],
@@ -162,19 +193,25 @@ await dakota.wallets.createTransaction(wallet.id, {
 });
 ```
 
-The canonical JSON form mirrors the
-[policy-engine](https://github.com/dakota-xyz/policy-engine)
-`CanonicalizeIntent` implementation. The signature is over the SHA-256
-hash of the RFC-8785-canonicalized JSON of the intent (alphabetical key
-order, normalized numbers, no whitespace).
+**Write `amount` in its shortest decimal form** (`"100"`, `"1.5"`).
+The server parses the amount as a decimal and checks the signature
+against the re-serialized intent, so trailing zeros (`"100.00"`) make
+your signature cover different bytes.
+
+Progress arrives as `wallet.transaction.updated` webhooks
+(`status_code`: `waiting_for_signature → broadcasted →
+awaiting_confirmation → completed | failed | reversed`).
 
 ## Reference implementation
 
-A lazy provisioning function — idempotent, caches the wallet on your side
+A lazy provisioning function, idempotent, caches the wallet on your side
 so you only call Dakota once:
 
 ```ts
-async function ensureTreasuryWallet(customer: Customer, profileDb: Profile) {
+async function ensureTreasuryWallet(
+  customer: { id: string; name: string },
+  profileDb: Profile,
+) {
   if (profileDb.dakota_wallet_id && profileDb.dakota_wallet_address) {
     return {
       walletId: profileDb.dakota_wallet_id,
@@ -183,28 +220,38 @@ async function ensureTreasuryWallet(customer: Customer, profileDb: Profile) {
   }
 
   const dakota = getDakotaClient();
-  const { publicKey } = generateKeyPairSync("ec", {
+  const { privateKey: privateKeyDer } = generateKeyPairSync("ec", {
     namedCurve: "P-256",
     publicKeyEncoding: { type: "spki", format: "der" },
     privateKeyEncoding: { type: "pkcs8", format: "der" },
   });
-  const memberKey = Buffer.from(publicKey).toString("base64");
+  // Store the key BEFORE you register it, so a crash cannot orphan the wallet.
+  await kms.storeSignerKey(customer.id, privateKeyDer);
+  const publicKey = P256MandateSigner.fromPrivateKey(privateKeyDer).publicKeyBase64();
 
   await dakota.signers.create({
     name: `${customer.name} Signer`,
-    public_key: memberKey,
+    public_key: publicKey,
     key_type: "ES256",
   });
   const group = await dakota.signerGroups.create({
     name: `${customer.name} Group ${Date.now() % 100000}`,
-    member_keys: [memberKey],
+    member_keys: [publicKey],
+  });
+  const policy = await dakota.policies.create({
+    name: `${customer.name} default policy`,
+    signer_group_id: group.id,
+    rules: [
+      { rule_type: "approval_threshold", action: "allow",
+        definition: { threshold: 1 } as unknown as Definition },
+    ],
   });
   const wallet = await dakota.wallets.create({
     customer_id: customer.id,
     family: "evm",
     name: `${customer.name} Treasury`,
     signer_groups: [group.id],
-    policies: [],
+    policies: [policy.id],
   });
 
   await profileDb.update({
@@ -219,18 +266,21 @@ async function ensureTreasuryWallet(customer: Customer, profileDb: Profile) {
 ## What next
 
 - Pair with [`dakota-receive-usd`](../dakota-receive-usd/SKILL.md) to also
-  accept ACH inbound. The on-ramp's `crypto_destination_id` can point at
+  accept ACH inbound. The on-ramp's crypto destination can point at
   this wallet's address so US ACH → USDC lands directly in your treasury.
 - [`dakota-send-payment`](../dakota-send-payment/SKILL.md) to spend
   from the wallet.
 - [`dakota-compliance-policies`](../dakota-compliance-policies/SKILL.md) to
-  attach amount-threshold or address-list rules to the wallet.
+  add amount caps or address allowlists.
+- [`dakota-webhooks`](../dakota-webhooks/SKILL.md) for `wallet.deposit`.
 
 ## Canonical reference
 
-- Wallets overview — [docs.dakota.xyz/documentation/wallets](https://docs.dakota.xyz/documentation/wallets)
-- Wallet signing (intent canonicalization + ECDSA) — [docs.dakota.xyz/documentation/wallet-signing](https://docs.dakota.xyz/documentation/wallet-signing)
-- Signing guide (end-to-end) — [docs.dakota.xyz/documentation/signing-guide](https://docs.dakota.xyz/documentation/signing-guide)
-- Without the SDK: `POST /signers`, `POST /signer-groups`, `POST /wallets`,
-  `GET /wallets/{id}/balances`, `POST /wallets/{id}/transactions` — see
-  [docs.dakota.xyz/api-reference](https://docs.dakota.xyz/api-reference).
+- Wallets overview: [docs.dakota.xyz/documentation/wallets](https://docs.dakota.xyz/documentation/wallets)
+- Wallet signing (intent canonicalization + ECDSA): [docs.dakota.xyz/documentation/wallet-signing](https://docs.dakota.xyz/documentation/wallet-signing)
+- Signing guide (end-to-end): [docs.dakota.xyz/documentation/signing-guide](https://docs.dakota.xyz/documentation/signing-guide)
+- Passkey (WebAuthn) signers: [docs.dakota.xyz/documentation/webauthn-signing](https://docs.dakota.xyz/documentation/webauthn-signing)
+- Without the SDK: `POST /signers`, `POST /signer-groups`, `POST /policies`, `POST /wallets`,
+  `GET /wallets/{id}/balances`, `POST /wallets/{id}/transactions`,
+  `POST /sandbox/wallets/{id}/faucet`: see
+  [docs.dakota.xyz/api-reference/introduction](https://docs.dakota.xyz/api-reference/introduction).
