@@ -6,17 +6,18 @@ description: |
   outbound bank transfer. Covers single payouts and batch payroll.
 ---
 
-# Dakota — Send payment (USDC → USD ACH)
+# Dakota: Send payment (USDC → USD ACH)
 
 This is the off-ramp side. The operator spends from their USDC treasury;
 Dakota fires a USD ACH credit to the recipient's bank. Same pattern works
-for vendor invoices, contractor payroll, marketplace seller payouts —
+for vendor invoices, contractor payroll, marketplace seller payouts,
 the only thing that changes is the recipient's bank details.
 
-## The chain (4 calls)
+## The chain (3 calls)
 
 ```ts
 // PRE-REQ: customer is KYB-active.
+const sandbox = process.env.DAKOTA_ENV !== "production";
 
 // 1. Recipient = the payee (person or business)
 const recipient = await dakota.recipients.create(customer.id, {
@@ -24,7 +25,7 @@ const recipient = await dakota.recipients.create(customer.id, {
   address: {
     street1: "456 Worker Ave",
     city: "Austin",
-    region: "Texas",
+    region: "TX",                 // ISO 3166-2 subdivision code, not "Texas"
     postal_code: "73301",
     country: "US",
   },
@@ -40,124 +41,107 @@ const destination = await dakota.destinations.create(recipient.id, {
   aba_routing_number: "021000021",
   account_type: "checking",          // or "savings"
 });
-const destinationId =
-  (destination as any).destination_id ?? (destination as any).id;
+const destinationId = destination.id; // create returns { id }
 
-// 3. Off-ramp account = the USDC → USD pipe
-const offramp = await dakota.accounts.create({
-  account_type: "offramp",
-  fiat_destination_id: destinationId,
-  source_asset: "USDC",
-  source_network_id: "ethereum-mainnet",
-  destination_asset: "USD",
-  rail: "ach",
-  capabilities: ["ach"],
-});
-
-// 4. Send a payment
+// 3. Send a payment (a one-off transaction; no off-ramp account needed)
 const tx = await dakota.transactions.create({
   customer_id: customer.id,
   source_asset: "USDC",
-  source_network_id: "ethereum-mainnet",
+  source_network_id: sandbox ? "ethereum-sepolia" : "ethereum-mainnet",
   destination_id: destinationId,
   destination_asset: "USD",
   destination_payment_rail: "ach",
-  amount: "1500.00",
-  payment_reference: "Invoice 2026-001",  // shows on the receiving bank's statement
+  amount: sandbox ? "1.50" : "1500.00",   // sandbox cap: $2 per request
+  payment_reference: "Invoice 2026 001",  // ACH: 1-18 letters, digits, spaces
 });
-// tx.id              — transaction KSUID, save this
-// tx.status          — "pending" initially
-// tx.crypto_address  — where USDC should be sent to FUND this transaction
+// tx.id             , transaction KSUID, save this
+// tx.status         , "pending" initially
+// tx.crypto_address , send USDC here to FUND this transaction
+// tx.send_amount    , the exact USDC amount to send there
 ```
 
-Steps 1-3 are one-time per payee (or per address change). Step 4 is the
+Steps 1-2 are one-time per payee (or per bank change). Step 3 is the
 recurring "send a payment" call.
 
 ## Field traps
 
 | Field | Wrong | Right |
 |---|---|---|
-| `name` (recipient) | Customer's own name (`customer.name`) | Anything else — uniqueness is per-customer, and Dakota already auto-created a recipient with the customer's name |
-| `destination_type` (destination) | `"bank"` / `"ach"` | `"fiat_us"` for US bank, `"fiat_iban"` for IBAN |
+| `name` (recipient) | Customer's own name (`customer.name`) | Anything else, uniqueness is per-customer, and Dakota already auto-created a recipient with the customer's name |
+| `region` (recipient address) | `"Texas"` | `"TX"` (ISO 3166-2 subdivision) |
+| `destination_type` (destination) | `"bank"` / `"ach"` | `"fiat_us"` for US bank, `"fiat_iban"` for IBAN / SWIFT |
 | `account_type` (destination) | `"CHECKING"` | `"checking"` (lowercase) |
 | `aba_routing_number` | `"routing_number"` | The field name has the `aba_` prefix |
-| `rail` (offramp account) | `"us_bank_account"` | `"ach"` — note this is different from the on-ramp side |
-| `destination_payment_rail` (transaction) | `"us_bank_account"` | `"ach"` |
-
-The asymmetry between on-ramp `rail: "us_bank_account"` and off-ramp
-`rail: "ach"` is intentional and easy to miss.
+| `destination_payment_rail` (transaction) | `"us_bank_account"` / `"wire"` | `"ach"`, `"fedwire"`, `"fednow"` or `"swift"`. Optional: omit it and Dakota picks the rail |
+| `payment_reference` (ACH) | `"Invoice 2026-001"` | Letters, digits and spaces only, max 18 chars. A hyphen returns 400 |
+| `source_network_id` | `"ethereum-mainnet"` in sandbox | Sandbox accepts testnets only (`ethereum-sepolia`, `base-sepolia`, ...). Production accepts mainnets only |
+| `amount` | `"1500.00"` in sandbox | Max `"2.00"` per request in sandbox |
 
 ## Recipient name uniqueness
 
-Recipient names are **unique per customer** (per `db/migrations/00002_recipients_destinations.up.sql`).
-Two different customers can each have a "Jane Worker". One customer
-can't have two. Auto-created treasury recipients also count.
+Recipient names are **unique per customer**. Dakota ignores case and
+leading or trailing spaces, so "Jane Worker" and "jane worker " collide
+(409 Recipient Conflict). Two different customers can each have a
+"Jane Worker". The recipient that KYB approval creates with the
+customer's name also counts.
 
-If you're building a system that re-uses common names, suffix with
-something stable (employee id, last 4 of routing):
+The API also takes an optional `external_id` on a recipient (your own
+key, not unique) and filters on it:
+`GET /customers/{id}/recipients?external_id=...`. The TS SDK 3.x types
+do not include it yet, so use raw HTTP for it. If display names repeat,
+suffix them with something stable:
 
 ```ts
 const name = `${displayName} (${employeeId})`;
 ```
 
-A timestamp suffix works too, but it makes deduplication awkward — every
-re-run creates a new recipient.
+## Funding the payment
 
-## Sending the payment
+`transactions.create` returns immediately with `status: 'pending'` and
+a `crypto_address`. Dakota pays out the USD after the USDC arrives
+there.
 
-`transactions.create` returns immediately with `status: 'pending'`. The
-response includes a `crypto_address` field — that's where USDC needs to
-be sent from to fund the transaction.
-
-In production, the canonical flow is:
 1. You call `transactions.create`.
-2. You sign and post a `wallets.createTransaction` that sends `amount`
-   of USDC from your treasury wallet to `tx.crypto_address`.
+2. You send **exactly `tx.send_amount`** of USDC to `tx.crypto_address`,
+   in **one** transfer. The address takes one deposit only. In
+   production this is a signed `wallets.createTransaction` from your
+   treasury wallet (see [`dakota-receive-usdc`](../dakota-receive-usdc/SKILL.md)).
 3. Dakota detects the USDC on-chain.
 4. Dakota fires the ACH outbound to the recipient's bank.
-5. ACH settles in 1-3 business days; webhooks notify you of state changes.
+5. ACH settles in 1-3 business days. `transaction.one_off.updated`
+   webhooks report each status (see [`dakota-webhooks`](../dakota-webhooks/SKILL.md)).
 
-In sandbox the same flow works *if* you have a funded wallet. See
-[`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md) for the
-end-to-end including the wallet-tx signing path.
+Status values: `pending | processing | completed | failed | cancelled |
+reversed | pending_return | returned | pending_reversal`.
 
-## The amount field gotcha
+In sandbox the same flow works on testnets: the on-chain leg is a real
+testnet transfer and the ACH leg is mocked. See
+[`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md).
 
-When `tx.status === 'pending'` and there's no `send_amount` yet (no USDC
-has been quoted), **the API response omits the `amount` field**:
+## Amounts in the response
 
-```json
-{
-  "id": "3Ea8YBuiTNIxK74RqrlbloJLzpM",
-  "status": "pending",
-  "source_asset": "USDC",
-  "destination_asset": "USD",
-  "destination_routing_number": "021000021",
-  "destination_account_number_last_four": "6789"
-  // NO amount. NO send_amount.
-}
-```
+`amount` and `send_amount` in the response are the **deposit to send,
+in the source asset** (USDC here). They are present when you sent
+`amount` and the pair is at par (for example USDC → USD). They are
+absent when you omit `amount`, pay out a non-USD currency (FX), or send
+a USD amount below one cent.
 
-This is from the platform mapper (`internal/api/mappers/one_off_transactions.go`):
-`response.Amount` is only set when `transaction.SendAmount != nil`.
-
-**Cache the amount you submitted** when you call `transactions.create`,
-keyed by `tx.id`. Otherwise your UI shows `$0` for pending payouts.
+The response does not echo the payout amount you asked for. Webhooks
+carry it as `destination_amount`. If your UI lists payouts, store the
+requested amount at create time, keyed by `tx.id`:
 
 ```ts
-// At create time:
 await db.paymentAmounts.upsert({
   dakota_transaction_id: tx.id,
   amount,
   currency: "USD",
 });
 
-// At list time:
-const txs = await dakota.transactions.list().toArray();
+const txs = await dakota.transactions.list({ customer_id: customer.id }).toArray();
 const myAmounts = await db.paymentAmounts.findByTxIds(txs.map(t => t.id));
 const merged = txs.map(t => ({
   ...t,
-  amount: (t as any).amount ?? myAmounts[t.id] ?? "0",
+  amount: myAmounts[t.id] ?? t.amount ?? "0",
 }));
 ```
 
@@ -181,30 +165,43 @@ const results = await Promise.allSettled(payments.map(sendOne));
 ```
 
 Pick sequential for batches < 50. Parallel is fine above that **if** the
-SDK's retry policy is configured (`maxAttempts: 5+`, exponential
-backoff). Dakota rate-limits per API key — read the response headers.
+SDK's retry policy is configured (`retryPolicy: { maxAttempts: 5 }`;
+the default is 3). Dakota rate-limits per API key. Read
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` and
+`Retry-After`.
 
 ## Listing past transactions
 
 ```ts
 const txs = await dakota.transactions
-  .list({ customer_id: customer.id })  // ← can be unreliable in sandbox
+  .list({ customer_id: customer.id })
   .toArray();
 ```
 
-**Sandbox quirk:** `transactions.list({ customer_id })` returns empty
-for some valid customer ids whose transactions are visible if you call
-`list()` without the filter. Work around with an unfiltered list +
-client-side filter:
+The TS SDK (3.x) asks for one-off transactions by default. With raw
+HTTP, send `GET /transactions?transaction_type=one_off&customer_id=...`.
+`customer_id` alone selects the auto-account (on-ramp / off-ramp)
+family, so one-off payouts do not appear.
 
-```ts
-const all = await dakota.transactions.list().toArray();
-const mine = all.filter(t => (t as any).customer_id === customer.id);
-```
+## Optional: a reusable off-ramp account
 
-This is a known sandbox indexing issue tracked in
-[`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md). Production
-isn't affected.
+A one-off needs no account. If you want a standing USDC → USD pipe to
+one bank destination (every deposit to its address pays out), create an
+off-ramp account with `account_type: "offramp"`,
+`fiat_destination_id`, `source_asset`, `source_network_id`,
+`destination_asset` and `rail` (`ach`, `fedwire`, `fednow` or `swift`).
+Its deposits report as `transaction.auto.*`, not one-off events. See
+[common flows](https://docs.dakota.xyz/documentation/common-flows).
+
+Both one-offs and accounts accept a developer fee: `developer_fee_bps`
+or `developer_fee_fixed`, never both. See
+[advanced flows](https://docs.dakota.xyz/documentation/advanced-flows#developer-fees).
+
+## International payouts
+
+For SWIFT and FX payouts (a `fiat_iban` destination,
+`destination_payment_rail: "swift"`, quotes), see
+[`dakota-international-payout`](../dakota-international-payout/SKILL.md).
 
 ## Reference implementation
 
@@ -215,19 +212,19 @@ async function payRecipient(opts: {
   customerId: string;
   recipientId: string;
   amount: string;
-  reference: string;
+  reference: string; // ACH: 1-18 letters, digits, spaces
 }) {
   const dakota = getDakotaClient();
+  const sandbox = process.env.DAKOTA_ENV !== "production";
   const destinations = await dakota.destinations.list(opts.recipientId).toArray();
   const bank = destinations.find(d => d.destination_type === "fiat_us");
   if (!bank) throw new Error("Recipient has no fiat_us destination");
-  const destinationId = (bank as any).destination_id ?? (bank as any).id;
 
   const tx = await dakota.transactions.create({
     customer_id: opts.customerId,
     source_asset: "USDC",
-    source_network_id: "ethereum-mainnet",
-    destination_id: destinationId,
+    source_network_id: sandbox ? "ethereum-sepolia" : "ethereum-mainnet",
+    destination_id: bank.destination_id, // list rows use destination_id
     destination_asset: "USD",
     destination_payment_rail: "ach",
     amount: opts.amount,
@@ -240,23 +237,23 @@ async function payRecipient(opts: {
     currency: "USD",
   });
 
-  return tx;
+  return tx; // fund it: send tx.send_amount USDC to tx.crypto_address
 }
 ```
 
 ## What next
 
-- [`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md) — how to
+- [`dakota-sandbox-testing`](../dakota-sandbox-testing/SKILL.md), how to
   watch a sandbox payout move from pending → completed.
-- [`dakota-compliance-policies`](../dakota-compliance-policies/SKILL.md) —
-  block payments above a threshold before they're submitted.
+- [`dakota-compliance-policies`](../dakota-compliance-policies/SKILL.md):
+  guard the wallet transfer that funds a payout.
 
 ## Canonical reference
 
-- Common flows (off-ramp included) — [docs.dakota.xyz/documentation/common-flows](https://docs.dakota.xyz/documentation/common-flows)
-- Advanced flows (multi-rail, complex routing) — [docs.dakota.xyz/documentation/advanced-flows](https://docs.dakota.xyz/documentation/advanced-flows)
-- Destinations + recipients — [docs.dakota.xyz/documentation/destinations-recipients](https://docs.dakota.xyz/documentation/destinations-recipients)
-- Transaction state lifecycle — [docs.dakota.xyz/api-reference/state-lifecycles](https://docs.dakota.xyz/api-reference/state-lifecycles)
+- Common flows (off-ramp included): [docs.dakota.xyz/documentation/common-flows](https://docs.dakota.xyz/documentation/common-flows)
+- Advanced flows (SWIFT, developer fees): [docs.dakota.xyz/documentation/advanced-flows](https://docs.dakota.xyz/documentation/advanced-flows)
+- Destinations + recipients: [docs.dakota.xyz/documentation/destinations-recipients](https://docs.dakota.xyz/documentation/destinations-recipients)
+- Transaction state lifecycle: [docs.dakota.xyz/api-reference/state-lifecycles](https://docs.dakota.xyz/api-reference/state-lifecycles)
 - Without the SDK: `POST /customers/{id}/recipients`, `POST /recipients/{id}/destinations`,
-  `POST /accounts`, `POST /transactions`, `GET /transactions` — see
-  [docs.dakota.xyz/api-reference](https://docs.dakota.xyz/api-reference).
+  `POST /transactions`, `GET /transactions`: see
+  [docs.dakota.xyz/api-reference/introduction](https://docs.dakota.xyz/api-reference/introduction).

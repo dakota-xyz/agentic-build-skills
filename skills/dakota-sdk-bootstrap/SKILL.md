@@ -4,12 +4,13 @@ description: |
   Install and configure the Dakota TypeScript SDK in a project, build the
   client singleton, and wire it for sandbox + production. Use when
   scaffolding a new Dakota integration or adding the SDK to an existing
-  app. The full install + auth modes + retry policy reference lives in
-  AGENTS.md inside the SDK repo and at docs.dakota.xyz — this skill is
-  the pack-shaped summary.
+  app. The full config reference (auth modes, retry policy, timeouts)
+  lives in the SDK's README.md and CLAUDE.md, the per-method reference
+  in its AGENTS.md, and the docs at docs.dakota.xyz. This skill is the
+  pack-shaped summary.
 ---
 
-# Dakota — SDK bootstrap
+# Dakota: SDK bootstrap
 
 ## Install
 
@@ -17,7 +18,13 @@ description: |
 npm install @dakota-xyz/ts-sdk
 ```
 
-Targets `^1.4.x` at time of writing.
+Targets `^3.2.0` (the npm `latest` tag) at time of writing. If you upgrade from 1.x, note that
+2.0.0 moved webhook payloads under `event.data.object` (see the SDK's
+`CHANGELOG.md`).
+
+Go: `go get github.com/dakota-xyz/go-sdk`, then
+`client.New(client.WithAPIKey(...))`. See
+[docs.dakota.xyz/documentation/sdks](https://docs.dakota.xyz/documentation/sdks).
 
 ## Get an API key
 
@@ -26,13 +33,20 @@ shown again). Sandbox dashboard at `platform.sandbox.dakota.xyz`,
 production at `platform.dakota.xyz`. Full instructions:
 [docs.dakota.xyz/documentation/authentication/api-keys-headers](https://docs.dakota.xyz/documentation/authentication/api-keys-headers).
 
-Sandbox keys and production keys are completely separate — they live in
+Sandbox keys and production keys are completely separate. They live in
 separate dashboards. There is no flag that switches one into the other.
+
+Keys can carry a **scope**: `full_access`, `operate` or `read_only`. A
+key created without a scope has full access. A call the scope does not
+allow returns 403. Use a `read_only` key for dashboards and reporting
+jobs. See
+[docs.dakota.xyz/documentation/authentication/api-key-scopes](https://docs.dakota.xyz/documentation/authentication/api-key-scopes).
 
 ## Client singleton
 
-A singleton avoids re-issuing OAuth tokens on every request. One file
-per project:
+Build one client per process. The SDK sends your API key as a static
+`x-api-key` header, so there are no tokens to refresh. One instance
+keeps one config and one retry policy. One file per project:
 
 ```ts
 // lib/dakota.ts
@@ -51,13 +65,21 @@ export function getDakotaClient(): DakotaClient {
         process.env.DAKOTA_ENV === "production"
           ? Environment.Production
           : Environment.Sandbox,
+      // Optional. Defaults: maxAttempts 3, initialBackoffMs 200,
+      // maxBackoffMs 2000. Retries 429, 500, 502, 503, 504.
+      // retryPolicy: { maxAttempts: 5 },
+      // Optional. Per-attempt timeout in ms, default 15000.
+      // timeout: 15000,
     });
   }
   return _client;
 }
 ```
 
-Server-only — never construct the client in browser code.
+Server-only, never construct the client in browser code.
+
+List methods return async iterators. Use `for await (const c of
+dakota.customers.list())`, or `.toArray()` to collect every page.
 
 ## Required headers
 
@@ -68,18 +90,30 @@ HTTP, every request needs them:
 |---|---|---|
 | `x-api-key` | every request | your API key |
 | `Content-Type: application/json` | requests with a body | constant |
-| `x-idempotency-key` | **POST requests only** | a unique UUID per logical operation |
+| `x-idempotency-key` | **POST, PUT and PATCH** (and the DELETEs listed below) | a unique UUID per logical operation |
 
-The idempotency key is a UUID — generate one per logical operation
-(not per retry). If a POST is retried with the same `x-idempotency-key`
-and the same body, Dakota returns the cached response from the first
-attempt instead of creating a duplicate. Do **not** send the header on
-GET / PUT / PATCH / DELETE.
+The idempotency key is a UUID, generate one per logical operation
+(not per retry). If a request is retried with the same
+`x-idempotency-key` and the same body, Dakota returns the cached
+response from the first attempt instead of creating a duplicate.
+
+- Dakota keeps the key for 24 hours after a successful response.
+- The same key with a different body returns 422
+  `idempotency-key-reused`.
+- Error responses are not cached. Fix the request and retry with the
+  same key.
+- A POST, PUT or PATCH without the header returns 400
+  `Missing required X-Idempotency-Key header`.
+- Do not send it on GET. These DELETEs require it:
+  `/policies/{id}`, `/policies/{id}/rules/{rule_id}`,
+  `/policies/{id}/wallets/{wallet_id}`,
+  `/signer-groups/{id}/signers/{signer_id}`,
+  `/wallets/{id}/signer-groups/{group_id}`.
 
 The TypeScript SDK auto-generates idempotency keys via
-`automaticIdempotency: true` (default on). Override per call with
-`{ idempotencyKey: 'your-uuid' }` if you want a stable key (e.g.
-keyed to a user action so refresh-bashing is safe).
+`automaticIdempotency` (default `true`) on POST, PUT, PATCH and DELETE.
+Override per call with `{ idempotencyKey: 'your-uuid' }` if you want a
+stable key (e.g. keyed to a user action so refresh-bashing is safe).
 
 ## `.env.local` template
 
@@ -87,29 +121,36 @@ keyed to a user action so refresh-bashing is safe).
 # Required
 DAKOTA_API_KEY=
 
-# Optional — defaults to sandbox if unset or any non-"production" value
+# Optional: defaults to sandbox if unset or any non-"production" value
 DAKOTA_ENV=sandbox
 
-# Optional — set when wiring webhooks
+# Optional: Dakota's webhook public key (Ed25519, differs per
+# environment). Set when you verify webhooks.
 DAKOTA_WEBHOOK_PUBLIC_KEY=
 ```
 
 ## Error handling
 
 Catch `APIError` (HTTP non-2xx) and `TransportError` (network failure).
-Always log `requestId` from `APIError` — Dakota support reads their
-logs by it.
+The constructor throws `ConfigurationError` for a missing key or a bad
+config. Always log `requestId` from `APIError` (it can be `null`),
+Dakota support reads their logs by it.
 
 ```ts
 import { APIError, TransportError } from "@dakota-xyz/ts-sdk";
 
+const dakota = getDakotaClient();
 try {
   await dakota.customers.create({ ... });
 } catch (err) {
   if (err instanceof APIError) {
     console.error(err.statusCode, err.code, err.message, err.requestId);
+    // For end users: a plain-language message, when one exists.
+    const shown = err.userMessage ?? err.message;
+    // Some errors (e.g. terms-not-accepted) carry a self-service link.
+    if (err.resolutionUrl) { /* send the customer to it */ }
     if (err.retryable) {
-      // safe to retry
+      // safe to retry (429 / 5xx); the SDK already retried per retryPolicy
     }
   } else if (err instanceof TransportError) {
     console.error("network", err.message, err.cause);
@@ -119,25 +160,42 @@ try {
 
 Full error reference: [docs.dakota.xyz/api-reference/errors](https://docs.dakota.xyz/api-reference/errors).
 
+## Webhooks
+
+The webhook helpers are in a subpath export:
+
+```ts
+import { WebhookHandler, verifySignature } from "@dakota-xyz/ts-sdk/webhook";
+```
+
+`WebhookHandler` verifies the `x-webhook-signature` and
+`x-webhook-timestamp` headers against `DAKOTA_WEBHOOK_PUBLIC_KEY`, and
+offers `expressMiddleware()` and `handleRequest()`. The event payload
+is at `event.data.object`. Full guide:
+[docs.dakota.xyz/documentation/webhooks](https://docs.dakota.xyz/documentation/webhooks).
+
 ## What next
 
 The next skill is
-[`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md) —
+[`dakota-customer-onboarding`](../dakota-customer-onboarding/SKILL.md):
 nothing else works until you have a KYB-active customer.
 
 ## Canonical reference
 
 This skill captures patterns. The truth source is the docs + the SDK's
-own `AGENTS.md` reference (~700 lines covering every resource and
+own `AGENTS.md` reference (~1,200 lines covering every resource and
 method):
 
-- SDK list + install — [docs.dakota.xyz/documentation/sdks](https://docs.dakota.xyz/documentation/sdks)
-- Authentication — [docs.dakota.xyz/documentation/authentication](https://docs.dakota.xyz/documentation/authentication)
-- API key headers — [docs.dakota.xyz/documentation/authentication/api-keys-headers](https://docs.dakota.xyz/documentation/authentication/api-keys-headers)
-- API errors — [docs.dakota.xyz/api-reference/errors](https://docs.dakota.xyz/api-reference/errors)
-- Quickstart — [docs.dakota.xyz/documentation/try-it-now](https://docs.dakota.xyz/documentation/try-it-now)
-- LLM-friendly index — [docs.dakota.xyz/llms.txt](https://docs.dakota.xyz/llms.txt)
-- SDK reference (in the repo) — `dakota-ts-sdk/AGENTS.md`
+- SDK list + install: [docs.dakota.xyz/documentation/sdks](https://docs.dakota.xyz/documentation/sdks)
+- Authentication: [docs.dakota.xyz/documentation/authentication](https://docs.dakota.xyz/documentation/authentication)
+- API key headers: [docs.dakota.xyz/documentation/authentication/api-keys-headers](https://docs.dakota.xyz/documentation/authentication/api-keys-headers)
+- API key scopes: [docs.dakota.xyz/documentation/authentication/api-key-scopes](https://docs.dakota.xyz/documentation/authentication/api-key-scopes)
+- API errors: [docs.dakota.xyz/api-reference/errors](https://docs.dakota.xyz/api-reference/errors)
+- Webhooks: [docs.dakota.xyz/documentation/webhooks](https://docs.dakota.xyz/documentation/webhooks)
+- Interactive API playground: [docs.dakota.xyz/documentation/try-it-now](https://docs.dakota.xyz/documentation/try-it-now)
+- Using LLMs with Dakota: [docs.dakota.xyz/documentation/using-llms](https://docs.dakota.xyz/documentation/using-llms)
+- LLM-friendly index: [docs.dakota.xyz/llms.txt](https://docs.dakota.xyz/llms.txt)
+- SDK reference (in the repo), `dakota-ts-sdk/AGENTS.md`
 
 Every method here maps 1:1 to a REST endpoint documented in the API
 reference.
